@@ -1,5 +1,5 @@
-import FileDashboard from "./file-dashboard";
+import FileAnalyzerV2 from "./file-analyzer-v2";
 
 export default function Home() {
-  return <FileDashboard />;
+  return <FileAnalyzerV2 />;
 }

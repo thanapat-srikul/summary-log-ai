@@ -9,11 +9,14 @@ test("ships the file analysis dashboard and metadata without starter artifacts",
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
-  assert.match(page, /FileDashboard/);
-  const fileDashboard = await readFile(new URL("../app/file-dashboard.tsx", import.meta.url), "utf8");
+  assert.match(page, /FileAnalyzerV2/);
+  const fileDashboard = await readFile(new URL("../app/file-analyzer-v2.tsx", import.meta.url), "utf8");
   assert.match(fileDashboard, /ZEEK FILE ANALYSIS/);
-  assert.match(fileDashboard, /ไม่ส่ง Raw Log ออกจากเครื่อง/);
+  assert.match(fileDashboard, /LOCAL PROCESSING/);
   assert.match(fileDashboard, /parseZeek/);
+  assert.match(fileDashboard, /Export CSV/);
+  assert.match(fileDashboard, /multiple/);
+  assert.match(fileDashboard, /ThresholdPanel/);
   assert.doesNotMatch(page, /LiveDashboard|EventSource/);
   assert.match(layout, /summary_large_image/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
