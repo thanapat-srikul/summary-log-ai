@@ -1,5 +1,5 @@
-import LiveDashboard from "./live-dashboard";
+import FileDashboard from "./file-dashboard";
 
 export default function Home() {
-  return <LiveDashboard />;
+  return <FileDashboard />;
 }
