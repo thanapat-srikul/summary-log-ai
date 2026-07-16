@@ -1,0 +1,1 @@
+ALTER TABLE `sources` ADD `spool_backlog` integer DEFAULT 0 NOT NULL;
