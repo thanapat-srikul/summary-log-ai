@@ -12,4 +12,4 @@ export async function generateMetadata():Promise<Metadata>{
   return{metadataBase:new URL(origin),title,description,openGraph:{title,description,type:"website",images:[{url:`${origin}/og.png`,width:1792,height:920,alt:"Summary Log AI Zeek file analysis dashboard"}]},twitter:{card:"summary_large_image",title,description,images:[`${origin}/og.png`]}};
 }
 
-export default function RootLayout({children}:Readonly<{children:React.ReactNode}>){return<html lang="th"><body>{children}</body></html>;}
+export default function RootLayout({children}:Readonly<{children:React.ReactNode}>){return<html lang="th"><body>{children}<a className="global-demo-link" href="/demo">ดู Dashboard ตัวอย่าง</a></body></html>;}

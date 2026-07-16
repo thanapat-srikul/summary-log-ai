@@ -17,6 +17,10 @@ test("ships the file analysis dashboard and metadata without starter artifacts",
   assert.match(fileDashboard, /Export CSV/);
   assert.match(fileDashboard, /multiple/);
   assert.match(fileDashboard, /ThresholdPanel/);
+  const demoDashboard = await readFile(new URL("../app/demo/demo-dashboard.tsx", import.meta.url), "utf8");
+  assert.match(demoDashboard, /DEMO DASHBOARD/);
+  assert.match(demoDashboard, /ตัวอย่าง Incident/);
+  assert.match(layout, /\/demo/);
   assert.doesNotMatch(page, /LiveDashboard|EventSource/);
   assert.match(layout, /summary_large_image/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
