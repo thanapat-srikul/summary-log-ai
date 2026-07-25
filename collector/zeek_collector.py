@@ -197,7 +197,7 @@ class Spool:
 
 class HttpSender:
     def __init__(self, base_url: str, ingest_key: str, bypass_token: str, source_id: str) -> None:
-        self.url = base_url.rstrip("/") + "/api/ingest/zeek"
+        self.url = base_url.rstrip("/") + "/api/v1/ingest/zeek"
         self.ingest_key = ingest_key
         self.bypass_token = bypass_token
         self.source_id = source_id
@@ -251,8 +251,6 @@ def run() -> int:
     base_url = required_env("SUMMARY_LOG_URL")
     ingest_key = required_env("SUMMARY_LOG_INGEST_KEY")
     bypass_token = os.environ.get("OAI_SITES_BYPASS_TOKEN", "").strip()
-    if not bypass_token and not base_url.startswith(("http://localhost", "http://127.0.0.1")):
-        raise SystemExit("Missing required environment variable: OAI_SITES_BYPASS_TOKEN")
     interval = max(100, int(os.environ.get("FLUSH_INTERVAL_MS", "1000"))) / 1000
     max_batch = min(100, max(1, int(os.environ.get("MAX_BATCH_SIZE", "100"))))
     spool_path = Path(os.environ.get("COLLECTOR_SPOOL", str(Path(__file__).with_name("collector-spool.ndjson"))))

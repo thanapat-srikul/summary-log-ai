@@ -1,98 +1,128 @@
-# vinext-starter
+# Summary Log AI
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Self-hosted Zeek `conn.log` monitoring สำหรับเปลี่ยน Network Flow เป็น Dashboard, Incident workflow และ Email Alert โดยไม่จัดเก็บ Raw Log
 
-## Prerequisites
+## Architecture
 
-- Node.js `>=22.13.0`
+```text
+Zeek conn.log
+  └─ Python Collector (JSON/TSV, rotation, retry, spool)
+       └─ HTTPS POST /api/v1/ingest/zeek
+            └─ API + Rule Engine
+                 ├─ PostgreSQL summaries/incidents
+                 ├─ SSE dashboard updates
+                 └─ Background Worker → SMTP
+```
 
-## Quick Start
+หนึ่งการติดตั้งแทนหนึ่งองค์กร และรองรับ Zeek Source หลายเครื่อง
+
+## Requirements
+
+- Linux server: 4 vCPU, 8 GB RAM และพื้นที่ว่างอย่างน้อย 50 GB สำหรับการติดตั้งทั่วไป
+- Docker Engine 27+ และ Docker Compose v2
+- Domain ที่ชี้มายัง server และเปิด TCP 80/443 สำหรับ HTTPS
+- Zeek ที่สร้าง `conn.log` แบบ JSON หรือ TSV
+
+## Install
+
+```bash
+cp .env.selfhost.example .env
+```
+
+แก้ `.env` และกำหนด `POSTGRES_PASSWORD`, `APP_SECRET` อย่างน้อย 32 ตัวอักษร และ `SUMMARY_LOG_DOMAIN` จากนั้น:
+
+```bash
+docker compose up -d --build
+```
+
+เปิด `https://<SUMMARY_LOG_DOMAIN>/app` และทำ Setup Wizard เพื่อสร้าง Admin คนแรก
+
+## Connect a Zeek source
+
+1. เข้าหน้า **Sources** และสร้าง Source
+2. คัดลอก `SOURCE_ID` และ API key ที่แสดงเพียงครั้งเดียว
+3. ติดตั้ง Collector บนเครื่องที่อ่าน `conn.log` ได้
+4. สร้าง `/etc/summary-log-ai/collector.env`:
+
+```dotenv
+ZEEK_CONN_LOG=/opt/zeek/logs/current/conn.log
+SUMMARY_LOG_URL=https://monitor.example.com
+SUMMARY_LOG_INGEST_KEY=sla_replace_me
+SOURCE_ID=00000000-0000-0000-0000-000000000000
+COLLECTOR_SPOOL=/var/lib/summary-log-ai/collector-spool.ndjson
+FLUSH_INTERVAL_MS=1000
+MAX_BATCH_SIZE=100
+```
+
+คัดลอก `collector/zeek_collector.py` ไป `/opt/summary-log-ai/collector/` และใช้ `collector/summary-log-collector.service` เป็น systemd unit
+
+## Operations
+
+- Health: `GET /api/v1/health`
+- Logs: `docker compose logs -f api worker`
+- Stop collector: `systemctl stop summary-log-collector`
+- Stop stack: `docker compose down` (ข้อมูลใน volume ยังอยู่)
+- Rotate API key ในหน้า Sources หาก key รั่ว
+- ตั้ง SMTP และผู้รับในหน้า Settings แล้วใช้ Test Email
+
+### Backup
+
+```bash
+docker compose exec -T postgres pg_dump -U summary_log -d summary_log -Fc > summary-log.backup
+```
+
+### Restore
+
+หยุด API และ Worker ก่อน restore:
+
+```bash
+docker compose stop api worker
+docker compose exec -T postgres pg_restore -U summary_log -d summary_log --clean --if-exists < summary-log.backup
+docker compose start api worker
+```
+
+### Upgrade and rollback
+
+1. Backup ฐานข้อมูล
+2. อ่าน `CHANGELOG.md`
+3. ดึง release tag ที่ต้องการและรัน `docker compose up -d --build`
+4. หากต้อง rollback ให้กลับไป release tag เดิมและ restore backup เมื่อ migration ไม่ backward-compatible
+
+## Security defaults
+
+- Admin เป็นผู้สร้างผู้ใช้; ไม่มี public registration
+- Roles: Admin, Analyst, Viewer
+- Password ใช้ Argon2id
+- Session cookie เป็น HttpOnly, Secure, SameSite=Strict
+- Source API key เก็บเฉพาะ SHA-256 hash และแสดงครั้งเดียว
+- SMTP password เข้ารหัส AES-256-GCM ด้วย `APP_SECRET`
+- เก็บ summary และ Incident 30 วันโดยค่าเริ่มต้น; ไม่เก็บ Raw Log
+
+## Development
+
+Web:
 
 ```bash
 npm install
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+API:
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+cd services/api
+npm install
+npm run dev
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+Tests:
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+```bash
+npm test
+cd services/api && npm test
+python -m unittest collector/test_zeek_collector.py
+```
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+## License
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+Apache-2.0 — see `LICENSE`.

@@ -1,0 +1,79 @@
+name: summary-log-ai
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: summary_log
+      POSTGRES_USER: summary_log
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U summary_log -d summary_log"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks: [internal]
+
+  api:
+    build: ./services/api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://summary_log:${POSTGRES_PASSWORD}@postgres:5432/summary_log
+      APP_SECRET: ${APP_SECRET}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      PORT: "8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/v1/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [internal]
+
+  worker:
+    build: ./services/api
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment:
+      DATABASE_URL: postgresql://summary_log:${POSTGRES_PASSWORD}@postgres:5432/summary_log
+      APP_SECRET: ${APP_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [internal]
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      SUMMARY_LOG_DOMAIN: ${SUMMARY_LOG_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [web, api]
+    networks: [internal]
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:

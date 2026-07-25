@@ -2,6 +2,7 @@
 
 # dependencies
 /node_modules
+**/node_modules/
 /.pnp
 .pnp.*
 .yarn/*
@@ -37,6 +38,7 @@ yarn-error.log*
 # typescript
 next-env.d.ts
 /dist/
+**/dist/
 /.wrangler/
 /outputs/
 /work/
