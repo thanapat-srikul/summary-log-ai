@@ -12,7 +12,9 @@ const nf=new Intl.NumberFormat("th-TH");
 const bytes=(n:number)=>n>=1e9?`${(n/1e9).toFixed(2)} GB`:n>=1e6?`${(n/1e6).toFixed(1)} MB`:n>=1e3?`${(n/1e3).toFixed(1)} KB`:`${n} B`;
 
 async function json(url:string, init?:RequestInit) {
-  const response=await fetch(url,{...init,headers:{"Content-Type":"application/json",...(init?.headers??{})}});
+  const headers:Record<string,string>={...(init?.headers as Record<string,string>|undefined)};
+  if(init?.body!==undefined) headers["Content-Type"]="application/json";
+  const response=await fetch(url,{...init,headers});
   const body=await response.json().catch(()=>({}));
   if(!response.ok) throw new Error(body.message||body.error||"request_failed");
   return body;
