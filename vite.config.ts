@@ -1,5 +1,6 @@
 import vinext from "vinext";
 import { defineConfig } from "vite";
+import path from "node:path";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./build/sites-vite-plugin";
 
@@ -34,26 +35,41 @@ const localBindingConfig = {
 };
 
 export default defineConfig(async () => {
+  const isSelfHostedBuild = process.env.SELF_HOSTED_BUILD === "1";
+
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= "false";
   process.env.WRANGLER_LOG_PATH ??= ".wrangler/logs";
   process.env.MINIFLARE_REGISTRY_PATH ??= ".wrangler/registry";
 
-  // Wrangler snapshots its log path while the Cloudflare plugin is imported.
-  const { cloudflare } = await import("@cloudflare/vite-plugin");
+  const plugins = [vinext(), sites()];
 
-  return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
-    plugins: [
-      vinext(),
-      sites(),
+  if (!isSelfHostedBuild) {
+    // Wrangler snapshots its log path while the Cloudflare plugin is imported.
+    const { cloudflare } = await import("@cloudflare/vite-plugin");
+    plugins.push(
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         config: localBindingConfig,
-      }),
-    ],
+      }) as ReturnType<typeof vinext>,
+    );
+  }
+
+  return {
+    resolve: isSelfHostedBuild
+      ? {
+          alias: {
+            "cloudflare:workers": path.resolve(
+              process.cwd(),
+              "lib/selfhost-cloudflare-workers.ts",
+            ),
+          },
+        }
+      : undefined,
+    server: isCodexSeatbeltSandbox
+      ? { watch: { useFsEvents: false, usePolling: true } }
+      : undefined,
+    plugins,
   };
 });
