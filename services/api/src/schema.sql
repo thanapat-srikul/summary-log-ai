@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS incidents (
   reason text NOT NULL,
   suggested_action text NOT NULL,
   status text NOT NULL DEFAULT 'new' CHECK (status IN ('new','acknowledged','investigating','resolved')),
+  resolution text CHECK (resolution IS NULL OR resolution IN ('true_positive','false_positive','benign')),
   byte_count bigint NOT NULL DEFAULT 0,
   packet_count bigint NOT NULL DEFAULT 0,
   updated_at timestamptz NOT NULL DEFAULT now(),
@@ -155,3 +156,5 @@ CREATE INDEX IF NOT EXISTS host_buckets_risk_idx ON host_buckets(bucket_ts, max_
 CREATE INDEX IF NOT EXISTS incidents_detected_idx ON incidents(detected_at DESC);
 CREATE INDEX IF NOT EXISTS event_dedup_created_idx ON event_dedup(created_at);
 CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
+
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution text;

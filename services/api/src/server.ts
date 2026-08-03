@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import nodemailer from "nodemailer";
 import pg from "pg";
-import { evaluateRules, validateEvent, type ConnEvent } from "./rules.js";
+import { evaluateRules, validateEvent } from "./rules.js";
 
 const { Pool } = pg;
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "body", "password", "apiKey"] }, bodyLimit: 1024 * 1024 });
@@ -14,6 +14,7 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const sessionCookie = "summary_log_session";
 const appSecret = process.env.APP_SECRET ?? "";
 const allowedStates = new Set(["new", "acknowledged", "investigating", "resolved"]);
+const allowedResolutions = new Set(["true_positive", "false_positive", "benign"]);
 const failedStates = new Set(["S0", "REJ", "RSTO", "RSTR", "SH", "SHR", "OTH"]);
 const standardPorts = new Set([20, 21, 22, 25, 53, 67, 68, 80, 110, 123, 143, 161, 389, 443, 445, 465, 587, 636, 993, 995, 1433, 3306, 3389, 5432, 6379, 8080, 8443]);
 
@@ -96,7 +97,7 @@ await app.register(rateLimit, { global: false });
 app.get("/api/v1/health", async () => {
   const db = await pool.query("SELECT now() AS now");
   const sources = await pool.query("SELECT max(last_seen_at) AS latest FROM sources");
-  return { status: "ok", version: "0.1.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
+  return { status: "ok", version: "0.2.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
 });
 
 app.get("/api/v1/setup/status", async () => {
@@ -166,6 +167,8 @@ app.get("/api/v1/sources", { preHandler: requireAuth }, async (request: AuthedRe
 app.post("/api/v1/sources", { preHandler: [requireAuth, requireAdmin] }, async (request: AuthedRequest, reply) => {
   const name = asText((request.body as Record<string, unknown>).name, 100);
   if (!name) return reply.code(400).send({ error: "name_required" });
+  const duplicate = await pool.query("SELECT id FROM sources WHERE organization_id=$1 AND lower(name)=lower($2)", [request.principal!.organizationId, name]);
+  if (duplicate.rowCount) return reply.code(409).send({ error: "source_name_exists", message: "มี Source ชื่อนี้อยู่แล้ว" });
   const sourceId = id();
   const apiKey = `sla_${token(32)}`;
   await pool.query("INSERT INTO sources(id,organization_id,name,api_key_hash) VALUES($1,$2,$3,$4)", [sourceId, request.principal!.organizationId, name, sha256(apiKey)]);
@@ -178,6 +181,15 @@ app.post("/api/v1/sources/:id/rotate-key", { preHandler: [requireAuth, requireAd
   if (!result.rowCount) return reply.code(404).send({ error: "source_not_found" });
   await audit(request.principal!.organizationId, request.principal!.id, "source.rotate_key", "source", result.rows[0].id);
   return { apiKey, message: "API key จะแสดงเพียงครั้งเดียว" };
+});
+app.patch("/api/v1/sources/:id", { preHandler: [requireAuth, requireAdmin] }, async (request: AuthedRequest, reply) => {
+  const active = (request.body as Record<string, unknown>).active;
+  if (typeof active !== "boolean") return reply.code(400).send({ error: "active_required" });
+  const sourceId = (request.params as { id: string }).id;
+  const result = await pool.query("UPDATE sources SET active=$1 WHERE id=$2 AND organization_id=$3 RETURNING id", [active, sourceId, request.principal!.organizationId]);
+  if (!result.rowCount) return reply.code(404).send({ error: "source_not_found" });
+  await audit(request.principal!.organizationId, request.principal!.id, active ? "source.enable" : "source.disable", "source", sourceId);
+  return { ok: true, active };
 });
 
 app.post("/api/v1/ingest/zeek", async (request, reply) => {
@@ -292,13 +304,13 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
 
 app.get("/api/v1/dashboard/snapshot", { preHandler: requireAuth }, async (request: AuthedRequest) => {
   const orgId = request.principal!.organizationId;
-  const minutes = Math.min(1440, Math.max(5, Number((request.query as { minutes?: string }).minutes) || 15));
+  const minutes = Math.min(10080, Math.max(5, Number((request.query as { minutes?: string }).minutes) || 15));
   const [totals, timeline, severity, hosts, incidents, sources] = await Promise.all([
     pool.query(`SELECT coalesce(sum(flow_count),0)::bigint flows,coalesce(sum(byte_count),0)::bigint bytes,coalesce(sum(failed_count),0)::bigint failed,coalesce(sum(anomaly_count),0)::bigint anomalies FROM flow_buckets f JOIN sources s ON s.id=f.source_id WHERE s.organization_id=$1 AND f.bucket_ts>=now()-($2||' minutes')::interval`, [orgId, minutes]),
     pool.query(`SELECT extract(epoch from bucket_ts)*1000 bucket_ts,sum(flow_count)::bigint flows,sum(anomaly_count)::bigint anomalies FROM flow_buckets f JOIN sources s ON s.id=f.source_id WHERE s.organization_id=$1 AND bucket_ts>=now()-($2||' minutes')::interval GROUP BY bucket_ts ORDER BY bucket_ts`, [orgId, minutes]),
     pool.query(`SELECT severity,count(*)::int count FROM incidents i JOIN sources s ON s.id=i.source_id WHERE s.organization_id=$1 AND detected_at>=now()-($2||' minutes')::interval GROUP BY severity`, [orgId, minutes]),
     pool.query(`SELECT host.src_ip::text ip,max(host.max_score)::int score,sum(host.connection_count)::bigint connections,max(host.bucket_ts) last_seen_at FROM host_buckets host JOIN sources s ON s.id=host.source_id WHERE s.organization_id=$1 AND host.bucket_ts>=now()-($2||' minutes')::interval GROUP BY host.src_ip ORDER BY score DESC LIMIT 10`, [orgId, minutes]),
-    pool.query(`SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE s.organization_id=$1 ORDER BY i.detected_at DESC LIMIT 100`, [orgId]),
+    pool.query(`SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE s.organization_id=$1 AND i.status<>'resolved' ORDER BY i.detected_at DESC LIMIT 100`, [orgId]),
     pool.query(`SELECT id,name,active,last_seen_at,spool_backlog,CASE WHEN last_seen_at>now()-interval '15 seconds' THEN 'online' WHEN last_seen_at>now()-interval '2 minutes' THEN 'delayed' ELSE 'offline' END state FROM sources WHERE organization_id=$1 ORDER BY name`, [orgId]),
   ]);
   const sev = { Critical: 0, High: 0, Medium: 0, Low: 0 };
@@ -313,8 +325,22 @@ app.get("/api/v1/dashboard/snapshot", { preHandler: requireAuth }, async (reques
 });
 
 app.get("/api/v1/incidents", { preHandler: requireAuth }, async (request: AuthedRequest) => {
-  const result = await pool.query("SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE s.organization_id=$1 ORDER BY detected_at DESC LIMIT 500", [request.principal!.organizationId]);
+  const query = request.query as { status?: string; severity?: string; sourceId?: string; q?: string };
+  const values: unknown[] = [request.principal!.organizationId];
+  const where = ["s.organization_id=$1"];
+  if (query.status && query.status !== "all") { values.push(query.status); where.push(`i.status=$${values.length}`); }
+  if (query.severity && query.severity !== "all") { values.push(query.severity); where.push(`i.severity=$${values.length}`); }
+  if (query.sourceId) { values.push(query.sourceId); where.push(`i.source_id=$${values.length}`); }
+  if (query.q) { values.push(`%${asText(query.q, 100)}%`); where.push(`(i.src_ip::text ILIKE $${values.length} OR i.dst_ip::text ILIKE $${values.length} OR i.reason ILIKE $${values.length})`); }
+  const result = await pool.query(`SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE ${where.join(" AND ")} ORDER BY detected_at DESC LIMIT 500`, values);
   return { incidents: result.rows };
+});
+app.get("/api/v1/incidents/:id", { preHandler: requireAuth }, async (request: AuthedRequest, reply) => {
+  const incidentId = (request.params as { id: string }).id;
+  const incident = await pool.query("SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
+  if (!incident.rowCount) return reply.code(404).send({ error: "incident_not_found" });
+  const history = await pool.query("SELECT h.*,u.display_name actor_name FROM incident_history h LEFT JOIN users u ON u.id=h.actor_user_id WHERE h.incident_id=$1 ORDER BY h.created_at DESC", [incidentId]);
+  return { incident: incident.rows[0], history: history.rows };
 });
 app.patch("/api/v1/incidents/:id", { preHandler: [requireAuth, requireWrite] }, async (request: AuthedRequest, reply) => {
   const body = request.body as Record<string, unknown>;
@@ -323,9 +349,21 @@ app.patch("/api/v1/incidents/:id", { preHandler: [requireAuth, requireWrite] }, 
   const incidentId = (request.params as { id: string }).id;
   const previous = await pool.query("SELECT i.status FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
   if (!previous.rowCount) return reply.code(404).send({ error: "incident_not_found" });
-  await pool.query("UPDATE incidents SET status=$1,updated_at=now() WHERE id=$2", [status, incidentId]);
+  const resolution = asText(body.resolution, 30) || null;
+  if (resolution && !allowedResolutions.has(resolution)) return reply.code(400).send({ error: "invalid_resolution" });
+  await pool.query("UPDATE incidents SET status=$1,resolution=$2,updated_at=now() WHERE id=$3", [status, resolution, incidentId]);
   await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,note) VALUES($1,$2,$3,$4,$5)", [incidentId, request.principal!.id, previous.rows[0].status, status, asText(body.note, 500) || null]);
   return { ok: true };
+});
+app.post("/api/v1/incidents/:id/notes", { preHandler: [requireAuth, requireWrite] }, async (request: AuthedRequest, reply) => {
+  const incidentId = (request.params as { id: string }).id;
+  const note = asText((request.body as Record<string, unknown>).note, 500);
+  if (!note) return reply.code(400).send({ error: "note_required" });
+  const incident = await pool.query("SELECT i.status FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
+  if (!incident.rowCount) return reply.code(404).send({ error: "incident_not_found" });
+  await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,note) VALUES($1,$2,$3,$3,$4)", [incidentId, request.principal!.id, incident.rows[0].status, note]);
+  await pool.query("UPDATE incidents SET updated_at=now() WHERE id=$1", [incidentId]);
+  return reply.code(201).send({ ok: true });
 });
 
 app.get("/api/v1/allowlist", { preHandler: requireAuth }, async (request: AuthedRequest) => {
