@@ -24,6 +24,9 @@ test("rule scores are capped and include all triggered codes", () => {
   assert.equal(result.score, 100);
   assert.equal(result.severity, "Critical");
   assert.equal(result.codes.length, 7);
+  assert.equal(result.matches.length, 7);
+  assert.equal(result.matches.reduce((sum, match) => sum + match.points, 0), 145);
+  assert.equal(result.matches[0].actual, 150);
 });
 
 test("normal traffic remains low", () => {

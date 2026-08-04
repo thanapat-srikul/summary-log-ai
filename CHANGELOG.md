@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0
+
+- Merge matching incidents from the same Source and Source IP within a ten-minute window, including resolved-incident reopening.
+- Store occurrence summaries, score breakdowns, assignees, first/last seen timestamps, and auditable workflow history without Raw Logs.
+- Add strict New → Acknowledged → Investigating → Resolved transitions and required resolution classifications.
+- Add Admin-only assignment to active Admin/Analyst users and Viewer read-only enforcement.
+- Add full Incident List and Incident Detail routes with URL filters, sorting, pagination, evidence, notes, workflow actions, and occurrence timeline.
+
 ## 0.2.1
 
 - Display dashboard, source, incident, chart, and history timestamps in the configured organization timezone.

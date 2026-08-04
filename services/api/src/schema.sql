@@ -89,6 +89,14 @@ CREATE TABLE IF NOT EXISTS incidents (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (source_id, bucket_ts, src_ip)
 );
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS assignee_user_id uuid REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS first_seen_at timestamptz;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS occurrence_count integer NOT NULL DEFAULT 1;
+UPDATE incidents SET first_seen_at=coalesce(first_seen_at,detected_at),last_seen_at=coalesce(last_seen_at,detected_at);
+ALTER TABLE incidents ALTER COLUMN first_seen_at SET NOT NULL;
+ALTER TABLE incidents ALTER COLUMN last_seen_at SET NOT NULL;
+ALTER TABLE incidents DROP CONSTRAINT IF EXISTS incidents_source_id_bucket_ts_src_ip_key;
 CREATE TABLE IF NOT EXISTS incident_history (
   id bigserial PRIMARY KEY,
   incident_id uuid NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
@@ -98,6 +106,32 @@ CREATE TABLE IF NOT EXISTS incident_history (
   note text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE incident_history ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT 'status_changed';
+ALTER TABLE incident_history ADD COLUMN IF NOT EXISTS metadata jsonb NOT NULL DEFAULT '{}'::jsonb;
+CREATE TABLE IF NOT EXISTS incident_occurrences (
+  id uuid PRIMARY KEY,
+  incident_id uuid NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+  observed_at timestamptz NOT NULL,
+  src_ip inet NOT NULL,
+  dst_ip inet NOT NULL,
+  dst_port integer NOT NULL,
+  protocol text NOT NULL,
+  score integer NOT NULL CHECK (score BETWEEN 0 AND 100),
+  severity text NOT NULL CHECK (severity IN ('Medium','High','Critical')),
+  rule_codes text[] NOT NULL,
+  score_breakdown jsonb NOT NULL DEFAULT '[]'::jsonb,
+  connection_count bigint NOT NULL DEFAULT 0,
+  destination_count bigint NOT NULL DEFAULT 0,
+  failed_count bigint NOT NULL DEFAULT 0,
+  failed_ratio double precision NOT NULL DEFAULT 0,
+  byte_count bigint NOT NULL DEFAULT 0,
+  packet_count bigint NOT NULL DEFAULT 0,
+  max_duration_ms bigint NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO incident_occurrences(id,incident_id,observed_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,byte_count,packet_count)
+SELECT gen_random_uuid(),i.id,i.detected_at,i.src_ip,i.dst_ip,i.dst_port,i.protocol,i.score,i.severity,i.rule_codes,i.byte_count,i.packet_count
+FROM incidents i WHERE NOT EXISTS (SELECT 1 FROM incident_occurrences o WHERE o.incident_id=i.id);
 CREATE TABLE IF NOT EXISTS allowlist_entries (
   id uuid PRIMARY KEY,
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -142,6 +176,9 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (incident_id, recipient)
 );
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS occurrence_id uuid REFERENCES incident_occurrences(id) ON DELETE CASCADE;
+ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_incident_id_recipient_key;
+CREATE UNIQUE INDEX IF NOT EXISTS alert_deliveries_occurrence_recipient_idx ON alert_deliveries(occurrence_id,recipient) WHERE occurrence_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS audit_log (
   id bigserial PRIMARY KEY,
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
@@ -154,6 +191,10 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS flow_buckets_time_idx ON flow_buckets(bucket_ts);
 CREATE INDEX IF NOT EXISTS host_buckets_risk_idx ON host_buckets(bucket_ts, max_score DESC);
 CREATE INDEX IF NOT EXISTS incidents_detected_idx ON incidents(detected_at DESC);
+CREATE INDEX IF NOT EXISTS incidents_merge_idx ON incidents(source_id,src_ip,last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS incidents_assignee_idx ON incidents(assignee_user_id,last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS incidents_filter_idx ON incidents(status,severity,last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS incident_occurrences_incident_idx ON incident_occurrences(incident_id,observed_at DESC);
 CREATE INDEX IF NOT EXISTS event_dedup_created_idx ON event_dedup(created_at);
 CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
 

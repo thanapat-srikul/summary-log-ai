@@ -7,6 +7,7 @@ import fs from "node:fs/promises";
 import nodemailer from "nodemailer";
 import pg from "pg";
 import { evaluateRules, validateEvent } from "./rules.js";
+import { canTransition, type IncidentStatus } from "./incident-policy.js";
 
 const { Pool } = pg;
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "body", "password", "apiKey"] }, bodyLimit: 1024 * 1024 });
@@ -97,7 +98,7 @@ await app.register(rateLimit, { global: false });
 app.get("/api/v1/health", async () => {
   const db = await pool.query("SELECT now() AS now");
   const sources = await pool.query("SELECT max(last_seen_at) AS latest FROM sources");
-  return { status: "ok", version: "0.2.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
+  return { status: "ok", version: "0.3.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
 });
 
 app.get("/api/v1/setup/status", async () => {
@@ -253,21 +254,42 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
             AND (protocol IS NULL OR lower(protocol)=lower($5))) AS allowed
         `, [source.organization_id, source.id, event.orig_h, event.resp_p, event.proto]);
         if (!allowlisted.rows[0].allowed) {
-          const incidentId = id();
-          const incident = await client.query(`
-            INSERT INTO incidents(id,source_id,bucket_ts,detected_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,reason,suggested_action,byte_count,packet_count)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-            ON CONFLICT(source_id,bucket_ts,src_ip) DO UPDATE SET score=greatest(incidents.score,excluded.score),
-              severity=CASE WHEN excluded.score>incidents.score THEN excluded.severity ELSE incidents.severity END,
-              rule_codes=excluded.rule_codes,reason=excluded.reason,suggested_action=excluded.suggested_action,
-              byte_count=excluded.byte_count,packet_count=excluded.packet_count,updated_at=now()
-            RETURNING id,severity
-          `, [incidentId, source.id, bucket, new Date(event.ts * 1000), event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count)]);
+          const observedAt = new Date(event.ts * 1000);
+          const latest = await client.query(`
+            SELECT id,status FROM incidents
+            WHERE source_id=$1 AND src_ip=$2::inet AND last_seen_at<=$3
+              AND last_seen_at>=$3::timestamptz-interval '10 minutes'
+            ORDER BY last_seen_at DESC LIMIT 1 FOR UPDATE
+          `, [source.id, event.orig_h, observedAt]);
+          const wasResolved = latest.rows[0]?.status === "resolved";
+          const incidentId = latest.rows[0]?.id ?? id();
+          const incident = latest.rowCount ? await client.query(`
+            UPDATE incidents SET
+              last_seen_at=$2,detected_at=$2,dst_ip=$3,dst_port=$4,protocol=$5,
+              score=greatest(score,$6),severity=CASE WHEN $6>score THEN $7 ELSE severity END,
+              rule_codes=ARRAY(SELECT DISTINCT unnest(rule_codes || $8::text[])),
+              reason=$9,suggested_action=$10,byte_count=$11,packet_count=$12,
+              occurrence_count=occurrence_count+1,
+              status=CASE WHEN status='resolved' THEN 'investigating' ELSE status END,
+              resolution=CASE WHEN status='resolved' THEN NULL ELSE resolution END,updated_at=now()
+            WHERE id=$1 RETURNING id,severity,status
+          `, [incidentId, observedAt, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count)]) : await client.query(`
+            INSERT INTO incidents(id,source_id,bucket_ts,detected_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,reason,suggested_action,byte_count,packet_count,first_seen_at,last_seen_at,occurrence_count)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$4,$4,1)
+            RETURNING id,severity,status
+          `, [incidentId, source.id, bucket, observedAt, event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count)]);
+          const occurrenceId = id();
+          await client.query(`
+            INSERT INTO incident_occurrences(id,incident_id,observed_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,score_breakdown,connection_count,destination_count,failed_count,failed_ratio,byte_count,packet_count,max_duration_ms)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18)
+          `, [occurrenceId, incidentId, observedAt, event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, JSON.stringify(rule.matches), Number(h.connection_count), h.destinations.length, Number(h.failed_count), Number(h.failed_count) / Math.max(1, Number(h.connection_count)), Number(h.byte_count), Number(h.packet_count), Number(h.max_duration_ms)]);
+          await client.query(`INSERT INTO incident_history(incident_id,from_status,to_status,action,note,metadata)
+            VALUES($1,$2,$3,$4,$5,$6::jsonb)`, [incidentId, latest.rows[0]?.status ?? null, incident.rows[0].status, latest.rowCount ? (wasResolved ? "reopened" : "merged") : "created", wasResolved ? "Incident reopened after a matching occurrence" : null, JSON.stringify({ occurrenceId, observedAt })]);
           await client.query("UPDATE flow_buckets SET anomaly_count=anomaly_count+1 WHERE source_id=$1 AND bucket_ts=$2 AND protocol=$3", [source.id, bucket, event.proto]);
           if (["High", "Critical"].includes(incident.rows[0].severity)) {
             await client.query(`
-              INSERT INTO alert_deliveries(id,incident_id,recipient)
-              SELECT gen_random_uuid(),$1,recipient
+              INSERT INTO alert_deliveries(id,incident_id,occurrence_id,recipient)
+              SELECT gen_random_uuid(),$1,$5,recipient
               FROM system_settings settings
               CROSS JOIN unnest(settings.alert_recipients) recipient
               WHERE settings.organization_id=$2
@@ -283,8 +305,8 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
                     AND previous_incident.src_ip=$4::inet
                     AND previous.created_at>now()-(settings.alert_cooldown_minutes||' minutes')::interval
                 )
-              ON CONFLICT(incident_id,recipient) DO NOTHING
-            `, [incident.rows[0].id, source.organization_id, incident.rows[0].severity, event.orig_h]);
+              ON CONFLICT DO NOTHING
+            `, [incident.rows[0].id, source.organization_id, incident.rows[0].severity, event.orig_h, occurrenceId]);
           }
         }
       }
@@ -325,22 +347,43 @@ app.get("/api/v1/dashboard/snapshot", { preHandler: requireAuth }, async (reques
 });
 
 app.get("/api/v1/incidents", { preHandler: requireAuth }, async (request: AuthedRequest) => {
-  const query = request.query as { status?: string; severity?: string; sourceId?: string; q?: string };
+  const query = request.query as { status?: string; severity?: string; sourceId?: string; assigneeId?: string; ip?: string; q?: string; from?: string; to?: string; sort?: string; order?: string; page?: string; pageSize?: string };
   const values: unknown[] = [request.principal!.organizationId];
   const where = ["s.organization_id=$1"];
   if (query.status && query.status !== "all") { values.push(query.status); where.push(`i.status=$${values.length}`); }
   if (query.severity && query.severity !== "all") { values.push(query.severity); where.push(`i.severity=$${values.length}`); }
   if (query.sourceId) { values.push(query.sourceId); where.push(`i.source_id=$${values.length}`); }
-  if (query.q) { values.push(`%${asText(query.q, 100)}%`); where.push(`(i.src_ip::text ILIKE $${values.length} OR i.dst_ip::text ILIKE $${values.length} OR i.reason ILIKE $${values.length})`); }
-  const result = await pool.query(`SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE ${where.join(" AND ")} ORDER BY detected_at DESC LIMIT 500`, values);
-  return { incidents: result.rows };
+  if (query.assigneeId === "unassigned") where.push("i.assignee_user_id IS NULL");
+  else if (query.assigneeId) { values.push(query.assigneeId); where.push(`i.assignee_user_id=$${values.length}`); }
+  const ip = query.ip || query.q;
+  if (ip) { values.push(`%${asText(ip, 100)}%`); where.push(`(i.src_ip::text ILIKE $${values.length} OR i.dst_ip::text ILIKE $${values.length} OR i.reason ILIKE $${values.length})`); }
+  if (query.from && !Number.isNaN(Date.parse(query.from))) { values.push(new Date(query.from)); where.push(`i.last_seen_at>=$${values.length}`); }
+  if (query.to && !Number.isNaN(Date.parse(query.to))) { values.push(new Date(query.to)); where.push(`i.first_seen_at<=$${values.length}`); }
+  const sortColumns: Record<string,string> = { severity: "CASE i.severity WHEN 'Critical' THEN 3 WHEN 'High' THEN 2 ELSE 1 END", source: "s.name", ip: "i.src_ip", firstSeen: "i.first_seen_at", lastSeen: "i.last_seen_at" };
+  const sort = sortColumns[query.sort || "severity"] || sortColumns.severity;
+  const order = query.order === "asc" ? "ASC" : "DESC";
+  const page = Math.max(1, Number(query.page) || 1);
+  const pageSize = Math.min(100, Math.max(10, Number(query.pageSize) || 25));
+  const count = await pool.query(`SELECT count(*)::int total FROM incidents i JOIN sources s ON s.id=i.source_id WHERE ${where.join(" AND ")}`, values);
+  values.push(pageSize, (page - 1) * pageSize);
+  const result = await pool.query(`SELECT i.*,s.name source_name,u.display_name assignee_name,u.email assignee_email
+    FROM incidents i JOIN sources s ON s.id=i.source_id LEFT JOIN users u ON u.id=i.assignee_user_id
+    WHERE ${where.join(" AND ")} ORDER BY ${sort} ${order},i.last_seen_at DESC LIMIT $${values.length - 1} OFFSET $${values.length}`, values);
+  const total = Number(count.rows[0].total);
+  return { incidents: result.rows, pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) } };
 });
 app.get("/api/v1/incidents/:id", { preHandler: requireAuth }, async (request: AuthedRequest, reply) => {
   const incidentId = (request.params as { id: string }).id;
-  const incident = await pool.query("SELECT i.*,s.name source_name FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
+  const incident = await pool.query(`SELECT i.*,s.name source_name,u.display_name assignee_name,u.email assignee_email
+    FROM incidents i JOIN sources s ON s.id=i.source_id LEFT JOIN users u ON u.id=i.assignee_user_id
+    WHERE i.id=$1 AND s.organization_id=$2`, [incidentId, request.principal!.organizationId]);
   if (!incident.rowCount) return reply.code(404).send({ error: "incident_not_found" });
-  const history = await pool.query("SELECT h.*,u.display_name actor_name FROM incident_history h LEFT JOIN users u ON u.id=h.actor_user_id WHERE h.incident_id=$1 ORDER BY h.created_at DESC", [incidentId]);
-  return { incident: incident.rows[0], history: history.rows };
+  const [history,occurrences,assignees] = await Promise.all([
+    pool.query("SELECT h.*,u.display_name actor_name FROM incident_history h LEFT JOIN users u ON u.id=h.actor_user_id WHERE h.incident_id=$1 ORDER BY h.created_at DESC", [incidentId]),
+    pool.query("SELECT * FROM incident_occurrences WHERE incident_id=$1 ORDER BY observed_at DESC", [incidentId]),
+    pool.query("SELECT id,display_name,email,role FROM users WHERE organization_id=$1 AND active=true AND role IN ('admin','analyst') ORDER BY display_name", [request.principal!.organizationId]),
+  ]);
+  return { incident: incident.rows[0], occurrences: occurrences.rows, history: history.rows, assignees: assignees.rows };
 });
 app.patch("/api/v1/incidents/:id", { preHandler: [requireAuth, requireWrite] }, async (request: AuthedRequest, reply) => {
   const body = request.body as Record<string, unknown>;
@@ -349,10 +392,28 @@ app.patch("/api/v1/incidents/:id", { preHandler: [requireAuth, requireWrite] }, 
   const incidentId = (request.params as { id: string }).id;
   const previous = await pool.query("SELECT i.status FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
   if (!previous.rowCount) return reply.code(404).send({ error: "incident_not_found" });
+  if (!canTransition(previous.rows[0].status as IncidentStatus, status as IncidentStatus)) return reply.code(409).send({ error: "invalid_status_transition", from: previous.rows[0].status, to: status });
   const resolution = asText(body.resolution, 30) || null;
   if (resolution && !allowedResolutions.has(resolution)) return reply.code(400).send({ error: "invalid_resolution" });
-  await pool.query("UPDATE incidents SET status=$1,resolution=$2,updated_at=now() WHERE id=$3", [status, resolution, incidentId]);
-  await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,note) VALUES($1,$2,$3,$4,$5)", [incidentId, request.principal!.id, previous.rows[0].status, status, asText(body.note, 500) || null]);
+  if (status === "resolved" && !resolution) return reply.code(400).send({ error: "resolution_required" });
+  await pool.query("UPDATE incidents SET status=$1,resolution=$2,updated_at=now() WHERE id=$3", [status, status === "resolved" ? resolution : null, incidentId]);
+  await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,action,note,metadata) VALUES($1,$2,$3,$4,'status_changed',$5,$6::jsonb)", [incidentId, request.principal!.id, previous.rows[0].status, status, asText(body.note, 500) || null, JSON.stringify({ resolution: status === "resolved" ? resolution : null })]);
+  return { ok: true };
+});
+app.patch("/api/v1/incidents/:id/assignee", { preHandler: [requireAuth, requireAdmin] }, async (request: AuthedRequest, reply) => {
+  const incidentId = (request.params as { id: string }).id;
+  const assigneeUserId = asText((request.body as Record<string,unknown>).assigneeUserId, 80) || null;
+  const incident = await pool.query("SELECT i.status,i.assignee_user_id FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
+  if (!incident.rowCount) return reply.code(404).send({ error: "incident_not_found" });
+  if (assigneeUserId) {
+    const user = await pool.query("SELECT id FROM users WHERE id=$1 AND organization_id=$2 AND active=true AND role IN ('admin','analyst')", [assigneeUserId, request.principal!.organizationId]);
+    if (!user.rowCount) return reply.code(400).send({ error: "invalid_assignee" });
+  }
+  const old = incident.rows[0];
+  const nextStatus = assigneeUserId ? "investigating" : old.status;
+  await pool.query("UPDATE incidents SET assignee_user_id=$1,status=$2,resolution=CASE WHEN $2='investigating' THEN NULL ELSE resolution END,updated_at=now() WHERE id=$3", [assigneeUserId,nextStatus,incidentId]);
+  await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,action,note,metadata) VALUES($1,$2,$3,$4,'assigned',NULL,$5::jsonb)", [incidentId,request.principal!.id,old.status,nextStatus,JSON.stringify({ fromAssigneeUserId: old.assignee_user_id, toAssigneeUserId: assigneeUserId })]);
+  await audit(request.principal!.organizationId, request.principal!.id, "incident.assigned", "incident", incidentId);
   return { ok: true };
 });
 app.post("/api/v1/incidents/:id/notes", { preHandler: [requireAuth, requireWrite] }, async (request: AuthedRequest, reply) => {
@@ -361,7 +422,7 @@ app.post("/api/v1/incidents/:id/notes", { preHandler: [requireAuth, requireWrite
   if (!note) return reply.code(400).send({ error: "note_required" });
   const incident = await pool.query("SELECT i.status FROM incidents i JOIN sources s ON s.id=i.source_id WHERE i.id=$1 AND s.organization_id=$2", [incidentId, request.principal!.organizationId]);
   if (!incident.rowCount) return reply.code(404).send({ error: "incident_not_found" });
-  await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,note) VALUES($1,$2,$3,$3,$4)", [incidentId, request.principal!.id, incident.rows[0].status, note]);
+  await pool.query("INSERT INTO incident_history(incident_id,actor_user_id,from_status,to_status,action,note) VALUES($1,$2,$3,$3,'note_added',$4)", [incidentId, request.principal!.id, incident.rows[0].status, note]);
   await pool.query("UPDATE incidents SET updated_at=now() WHERE id=$1", [incidentId]);
   return reply.code(201).send({ ok: true });
 });
