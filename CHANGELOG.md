@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Display dashboard, source, incident, chart, and history timestamps in the configured organization timezone.
+- Fall back safely to `Asia/Bangkok` when the configured timezone is missing or invalid.
+- Show the active timezone beside the live dashboard update time.
+
 ## 0.2.0
 
 - Redesigned the self-hosted console around a clearer monitor, investigate, and resolve workflow.
