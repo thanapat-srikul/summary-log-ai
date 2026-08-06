@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0
+
+- Group qualifying Incident alerts into one email per recipient every five minutes.
+- Add a secondary per-recipient, Source, and Source IP email cooldown with suppression counters.
+- Add durable delivery items and attempt history without storing Raw Zeek Logs.
+- Add Alert History and Alert Detail pages with filtering, status KPIs, error details, and Admin retry.
+- Queue Test Email through the Worker so successful and failed tests appear in Alert History.
+- Prepare the notification model for future LINE and Microsoft Teams transports while enabling email only.
+
 ## 0.4.0
 
 - Add Admin-managed organization rule defaults and per-Source overrides for thresholds, scores, enabled state, and cooldown.

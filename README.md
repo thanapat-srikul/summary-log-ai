@@ -64,6 +64,8 @@ MAX_BATCH_SIZE=100
 - Stop stack: `docker compose down` (ข้อมูลใน volume ยังอยู่)
 - Rotate API key ในหน้า Sources หาก key รั่ว
 - ตั้ง SMTP และผู้รับในหน้า Settings แล้วใช้ Test Email
+- ตั้ง `SUMMARY_LOG_PUBLIC_URL` ให้ตรง URL ที่ผู้ดูแลใช้เปิด Dashboard เพื่อให้ลิงก์ในอีเมลถูกต้อง
+- Alert ระดับ High/Critical จะถูกรวมทุก 5 นาที ดูผลการส่งและ Retry ได้ที่ `/app/alerts`
 
 ### Backup
 

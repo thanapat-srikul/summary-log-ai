@@ -228,6 +228,59 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
 ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS occurrence_id uuid REFERENCES incident_occurrences(id) ON DELETE CASCADE;
 ALTER TABLE alert_deliveries DROP CONSTRAINT IF EXISTS alert_deliveries_incident_id_recipient_key;
 CREATE UNIQUE INDEX IF NOT EXISTS alert_deliveries_occurrence_recipient_idx ON alert_deliveries(occurrence_id,recipient) WHERE occurrence_id IS NOT NULL;
+ALTER TABLE alert_deliveries ALTER COLUMN incident_id DROP NOT NULL;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS organization_id uuid REFERENCES organizations(id) ON DELETE CASCADE;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS channel text NOT NULL DEFAULT 'email';
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS delivery_type text NOT NULL DEFAULT 'legacy';
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS window_start timestamptz;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS window_end timestamptz;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS highest_severity text;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS subject text;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS item_count integer NOT NULL DEFAULT 1;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS suppressed_count integer NOT NULL DEFAULT 0;
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
+UPDATE alert_deliveries d SET organization_id=s.organization_id,window_start=coalesce(d.window_start,d.created_at),window_end=coalesce(d.window_end,d.created_at),highest_severity=coalesce(d.highest_severity,i.severity),subject=coalesce(d.subject,'Legacy incident alert')
+FROM incidents i JOIN sources s ON s.id=i.source_id WHERE d.incident_id=i.id AND d.organization_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS alert_deliveries_digest_group_idx ON alert_deliveries(organization_id,recipient,channel,delivery_type,window_start) WHERE delivery_type='digest';
+CREATE INDEX IF NOT EXISTS alert_deliveries_history_idx ON alert_deliveries(organization_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS alert_deliveries_queue_idx ON alert_deliveries(status,next_attempt_at,window_end);
+CREATE TABLE IF NOT EXISTS alert_delivery_items (
+  id bigserial PRIMARY KEY,
+  delivery_id uuid NOT NULL REFERENCES alert_deliveries(id) ON DELETE CASCADE,
+  incident_id uuid REFERENCES incidents(id) ON DELETE SET NULL,
+  occurrence_id uuid REFERENCES incident_occurrences(id) ON DELETE SET NULL,
+  severity text NOT NULL,
+  summary jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE(delivery_id,occurrence_id)
+);
+INSERT INTO alert_delivery_items(delivery_id,incident_id,occurrence_id,severity,summary)
+SELECT d.id,d.incident_id,d.occurrence_id,coalesce(d.highest_severity,'High'),jsonb_build_object('legacy',true)
+FROM alert_deliveries d WHERE d.incident_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM alert_delivery_items x WHERE x.delivery_id=d.id);
+CREATE INDEX IF NOT EXISTS alert_delivery_items_incident_idx ON alert_delivery_items(incident_id,delivery_id);
+CREATE TABLE IF NOT EXISTS alert_attempts (
+  id bigserial PRIMARY KEY,
+  delivery_id uuid NOT NULL REFERENCES alert_deliveries(id) ON DELETE CASCADE,
+  attempt_no integer NOT NULL,
+  status text NOT NULL,
+  error text,
+  started_at timestamptz NOT NULL DEFAULT now(),
+  completed_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS alert_attempts_delivery_idx ON alert_attempts(delivery_id,started_at DESC);
+CREATE TABLE IF NOT EXISTS alert_suppressions (
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  recipient text NOT NULL,
+  channel text NOT NULL DEFAULT 'email',
+  source_id uuid NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  src_ip inet NOT NULL,
+  last_delivery_id uuid REFERENCES alert_deliveries(id) ON DELETE SET NULL,
+  last_triggered_at timestamptz NOT NULL,
+  cooldown_until timestamptz NOT NULL,
+  suppressed_count integer NOT NULL DEFAULT 0,
+  PRIMARY KEY(organization_id,recipient,channel,source_id,src_ip)
+);
+CREATE INDEX IF NOT EXISTS alert_suppressions_cooldown_idx ON alert_suppressions(cooldown_until);
 CREATE TABLE IF NOT EXISTS audit_log (
   id bigserial PRIMARY KEY,
   organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,

@@ -4,11 +4,11 @@ import rateLimit from "@fastify/rate-limit";
 import argon2 from "argon2";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import nodemailer from "nodemailer";
 import pg from "pg";
 import { evaluateRules, incidentThreshold, RULE_DEFINITIONS, validateEvent, type BaselineThreshold, type RuleConfig } from "./rules.js";
 import { canTransition, type IncidentStatus } from "./incident-policy.js";
 import { mergeRuleConfigs, validateRuleUpdate, type StoredRuleConfig } from "./rule-config.js";
+import { alertWindow, severityMeetsMinimum } from "./alert-policy.js";
 
 const { Pool } = pg;
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "body", "password", "apiKey"] }, bodyLimit: 1024 * 1024 });
@@ -54,13 +54,6 @@ function encryptSecret(value: string) {
   const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
   return [iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), encrypted.toString("base64url")].join(".");
 }
-function decryptSecret(value: string) {
-  const [iv, tag, data] = value.split(".");
-  const key = crypto.createHash("sha256").update(appSecret).digest();
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(iv, "base64url"));
-  decipher.setAuthTag(Buffer.from(tag, "base64url"));
-  return Buffer.concat([decipher.update(Buffer.from(data, "base64url")), decipher.final()]).toString("utf8");
-}
 
 async function migrate() {
   const sql = await fs.readFile(new URL("./schema.sql", import.meta.url), "utf8");
@@ -99,6 +92,9 @@ async function requireWrite(request: AuthedRequest, reply: FastifyReply) {
   if (!request.principal || request.principal.role === "viewer") return reply.code(403).send({ error: "insufficient_role" });
   if (request.headers["x-csrf-token"] !== request.principal.csrfToken) return reply.code(403).send({ error: "invalid_csrf_token" });
 }
+async function requireAlertRead(request: AuthedRequest, reply: FastifyReply) {
+  if (!request.principal || request.principal.role === "viewer") return reply.code(403).send({ error: "insufficient_role" });
+}
 async function requireCsrf(request: AuthedRequest, reply: FastifyReply) {
   if (!request.principal || request.headers["x-csrf-token"] !== request.principal.csrfToken) return reply.code(403).send({ error: "invalid_csrf_token" });
 }
@@ -113,7 +109,7 @@ await app.register(rateLimit, { global: false });
 app.get("/api/v1/health", async () => {
   const db = await pool.query("SELECT now() AS now");
   const sources = await pool.query("SELECT max(last_seen_at) AS latest FROM sources");
-  return { status: "ok", version: "0.4.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
+  return { status: "ok", version: "0.5.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
 });
 
 app.get("/api/v1/setup/status", async () => {
@@ -211,7 +207,7 @@ app.patch("/api/v1/sources/:id", { preHandler: [requireAuth, requireAdmin] }, as
 app.post("/api/v1/ingest/zeek", async (request, reply) => {
   const auth = request.headers.authorization;
   if (!auth?.startsWith("Bearer ")) return reply.code(401).send({ error: "unauthorized" });
-  const sourceResult = await pool.query("SELECT id,organization_id FROM sources WHERE api_key_hash=$1 AND active=true", [sha256(auth.slice(7))]);
+  const sourceResult = await pool.query("SELECT id,organization_id,name FROM sources WHERE api_key_hash=$1 AND active=true", [sha256(auth.slice(7))]);
   if (!sourceResult.rowCount) return reply.code(401).send({ error: "unauthorized" });
   const source = sourceResult.rows[0];
   const body = request.body as Record<string, unknown>;
@@ -322,27 +318,33 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
           await client.query(`INSERT INTO incident_history(incident_id,from_status,to_status,action,note,metadata)
             VALUES($1,$2,$3,$4,$5,$6::jsonb)`, [incidentId, latest.rows[0]?.status ?? null, incident.rows[0].status, latest.rowCount ? (wasResolved ? "reopened" : "merged") : "created", wasResolved ? "Incident reopened after a matching occurrence" : null, JSON.stringify({ occurrenceId, observedAt })]);
           await client.query("UPDATE flow_buckets SET anomaly_count=anomaly_count+1 WHERE source_id=$1 AND bucket_ts=$2 AND protocol=$3", [source.id, bucket, event.proto]);
-          if (["High", "Critical"].includes(incident.rows[0].severity)) {
-            await client.query(`
-              INSERT INTO alert_deliveries(id,incident_id,occurrence_id,recipient)
-              SELECT gen_random_uuid(),$1,$5,recipient
-              FROM system_settings settings
-              CROSS JOIN unnest(settings.alert_recipients) recipient
-              WHERE settings.organization_id=$2
-                AND CASE settings.alert_min_severity
-                  WHEN 'Critical' THEN $3='Critical'
-                  WHEN 'High' THEN $3 IN ('High','Critical')
-                  ELSE true END
-                AND NOT EXISTS (
-                  SELECT 1 FROM alert_deliveries previous
-                  JOIN incidents previous_incident ON previous_incident.id=previous.incident_id
-                  JOIN sources previous_source ON previous_source.id=previous_incident.source_id
-                  WHERE previous.recipient=recipient AND previous_source.organization_id=$2
-                    AND previous_incident.src_ip=$4::inet
-                    AND previous.created_at>now()-(settings.alert_cooldown_minutes||' minutes')::interval
-                )
-              ON CONFLICT DO NOTHING
-            `, [incident.rows[0].id, source.organization_id, incident.rows[0].severity, event.orig_h, occurrenceId]);
+          const alertSettings=await client.query("SELECT alert_recipients,alert_min_severity,alert_cooldown_minutes FROM system_settings WHERE organization_id=$1",[source.organization_id]);
+          const settings=alertSettings.rows[0];
+          if(settings&&severityMeetsMinimum(incident.rows[0].severity,String(settings.alert_min_severity))){
+            const recipients=Array.isArray(settings.alert_recipients)?settings.alert_recipients as string[]:[];const window=alertWindow(observedAt);
+            for(const recipient of recipients){
+              const suppression=await client.query(`SELECT last_delivery_id,cooldown_until FROM alert_suppressions
+                WHERE organization_id=$1 AND recipient=$2 AND channel='email' AND source_id=$3 AND src_ip=$4::inet FOR UPDATE`,[source.organization_id,recipient,source.id,event.orig_h]);
+              if(suppression.rowCount&&observedAt<new Date(String(suppression.rows[0].cooldown_until))){
+                await client.query(`UPDATE alert_suppressions SET last_triggered_at=$5,suppressed_count=suppressed_count+1
+                  WHERE organization_id=$1 AND recipient=$2 AND channel='email' AND source_id=$3 AND src_ip=$4::inet`,[source.organization_id,recipient,source.id,event.orig_h,observedAt]);
+                if(suppression.rows[0].last_delivery_id)await client.query("UPDATE alert_deliveries SET suppressed_count=suppressed_count+1,updated_at=now() WHERE id=$1",[suppression.rows[0].last_delivery_id]);
+                continue;
+              }
+              const delivery=await client.query(`INSERT INTO alert_deliveries(id,organization_id,incident_id,recipient,channel,delivery_type,window_start,window_end,highest_severity,subject,item_count,next_attempt_at)
+                VALUES(gen_random_uuid(),$1,$2,$3,'email','digest',$4,$5,$6,$7,1,$5)
+                ON CONFLICT(organization_id,recipient,channel,delivery_type,window_start) WHERE delivery_type='digest'
+                DO UPDATE SET item_count=alert_deliveries.item_count+1,updated_at=now(),highest_severity=CASE
+                  WHEN excluded.highest_severity='Critical' OR alert_deliveries.highest_severity='Critical' THEN 'Critical'
+                  WHEN excluded.highest_severity='High' OR alert_deliveries.highest_severity='High' THEN 'High' ELSE 'Medium' END
+                RETURNING id`,[source.organization_id,incidentId,recipient,window.start,window.end,incident.rows[0].severity,`Summary Log AI: ${incident.rows[0].severity} security digest`]);
+              const summary={source:source.name,srcIp:event.orig_h,dstIp:event.resp_h,dstPort:event.resp_p,protocol:event.proto,score:rule.score,severity:incident.rows[0].severity,ruleCodes:activeCodes,firstSeen:observedAt,lastSeen:observedAt,suggestedAction:rule.action};
+              await client.query(`INSERT INTO alert_delivery_items(delivery_id,incident_id,occurrence_id,severity,summary) VALUES($1,$2,$3,$4,$5::jsonb)
+                ON CONFLICT(delivery_id,occurrence_id) DO NOTHING`,[delivery.rows[0].id,incidentId,occurrenceId,incident.rows[0].severity,JSON.stringify(summary)]);
+              await client.query(`INSERT INTO alert_suppressions(organization_id,recipient,channel,source_id,src_ip,last_delivery_id,last_triggered_at,cooldown_until)
+                VALUES($1,$2,'email',$3,$4,$5,$6,$6::timestamptz+($7||' minutes')::interval)
+                ON CONFLICT(organization_id,recipient,channel,source_id,src_ip) DO UPDATE SET last_delivery_id=excluded.last_delivery_id,last_triggered_at=excluded.last_triggered_at,cooldown_until=excluded.cooldown_until`,[source.organization_id,recipient,source.id,event.orig_h,delivery.rows[0].id,observedAt,Number(settings.alert_cooldown_minutes)||15]);
+            }
           }
           }
         }
@@ -415,12 +417,13 @@ app.get("/api/v1/incidents/:id", { preHandler: requireAuth }, async (request: Au
     FROM incidents i JOIN sources s ON s.id=i.source_id LEFT JOIN users u ON u.id=i.assignee_user_id
     WHERE i.id=$1 AND s.organization_id=$2`, [incidentId, request.principal!.organizationId]);
   if (!incident.rowCount) return reply.code(404).send({ error: "incident_not_found" });
-  const [history,occurrences,assignees] = await Promise.all([
+  const [history,occurrences,assignees,alerts] = await Promise.all([
     pool.query("SELECT h.*,u.display_name actor_name FROM incident_history h LEFT JOIN users u ON u.id=h.actor_user_id WHERE h.incident_id=$1 ORDER BY h.created_at DESC", [incidentId]),
     pool.query("SELECT * FROM incident_occurrences WHERE incident_id=$1 ORDER BY observed_at DESC", [incidentId]),
     pool.query("SELECT id,display_name,email,role FROM users WHERE organization_id=$1 AND active=true AND role IN ('admin','analyst') ORDER BY display_name", [request.principal!.organizationId]),
+    request.principal!.role==="viewer"?Promise.resolve({rows:[]}):pool.query("SELECT DISTINCT d.id,d.status,d.delivery_type,d.recipient,d.created_at FROM alert_delivery_items x JOIN alert_deliveries d ON d.id=x.delivery_id WHERE x.incident_id=$1 AND d.organization_id=$2 ORDER BY d.created_at DESC",[incidentId,request.principal!.organizationId]),
   ]);
-  return { incident: incident.rows[0], occurrences: occurrences.rows, history: history.rows, assignees: assignees.rows };
+  return { incident: incident.rows[0], occurrences: occurrences.rows, history: history.rows, assignees: assignees.rows, alerts: alerts.rows };
 });
 app.patch("/api/v1/incidents/:id", { preHandler: [requireAuth, requireWrite] }, async (request: AuthedRequest, reply) => {
   const body = request.body as Record<string, unknown>;
@@ -550,30 +553,53 @@ app.post("/api/v1/users", { preHandler: [requireAuth, requireAdmin] }, async (re
   return reply.code(201).send({ id: userId });
 });
 
+app.get("/api/v1/alerts",{preHandler:[requireAuth,requireAlertRead]},async(request:AuthedRequest)=>{
+  const query=request.query as{status?:string;severity?:string;recipient?:string;from?:string;to?:string;page?:string;pageSize?:string};const values:unknown[]=[request.principal!.organizationId];const where=["d.organization_id=$1"];
+  if(query.status&&query.status!=="all"){values.push(query.status);where.push(`d.status=$${values.length}`);}if(query.severity&&query.severity!=="all"){values.push(query.severity);where.push(`d.highest_severity=$${values.length}`);}if(query.recipient){values.push(`%${asText(query.recipient,254)}%`);where.push(`d.recipient ILIKE $${values.length}`);}if(query.from&&!Number.isNaN(Date.parse(query.from))){values.push(new Date(query.from));where.push(`d.created_at>=$${values.length}`);}if(query.to&&!Number.isNaN(Date.parse(query.to))){values.push(new Date(query.to));where.push(`d.created_at<=$${values.length}`);}
+  const page=Math.max(1,Number(query.page)||1);const pageSize=Math.min(100,Math.max(10,Number(query.pageSize)||25));const count=await pool.query(`SELECT count(*)::int total FROM alert_deliveries d WHERE ${where.join(" AND ")}`,values);
+  const kpis=await pool.query(`SELECT count(*) FILTER(WHERE status IN ('pending','sending'))::int pending,count(*) FILTER(WHERE status='sent')::int sent,count(*) FILTER(WHERE status='failed')::int failed FROM alert_deliveries WHERE organization_id=$1 AND created_at>=now()-interval '24 hours'`,[request.principal!.organizationId]);
+  values.push(pageSize,(page-1)*pageSize);const rows=await pool.query(`SELECT d.* FROM alert_deliveries d WHERE ${where.join(" AND ")} ORDER BY d.created_at DESC LIMIT $${values.length-1} OFFSET $${values.length}`,values);const total=Number(count.rows[0].total);
+  return{alerts:rows.rows,kpis:kpis.rows[0],pagination:{page,pageSize,total,totalPages:Math.ceil(total/pageSize)}};
+});
+
+app.get("/api/v1/alerts/:id",{preHandler:[requireAuth,requireAlertRead]},async(request:AuthedRequest,reply)=>{
+  const alertId=(request.params as{id:string}).id;const delivery=await pool.query("SELECT * FROM alert_deliveries WHERE id=$1 AND organization_id=$2",[alertId,request.principal!.organizationId]);if(!delivery.rowCount)return reply.code(404).send({error:"alert_not_found"});
+  const[items,attempts]=await Promise.all([pool.query("SELECT * FROM alert_delivery_items WHERE delivery_id=$1 ORDER BY created_at",[alertId]),pool.query("SELECT * FROM alert_attempts WHERE delivery_id=$1 ORDER BY started_at DESC",[alertId])]);return{alert:delivery.rows[0],items:items.rows,attempts:attempts.rows};
+});
+
+app.post("/api/v1/alerts/:id/retry",{preHandler:[requireAuth,requireAdmin]},async(request:AuthedRequest,reply)=>{
+  const alertId=(request.params as{id:string}).id;const result=await pool.query("UPDATE alert_deliveries SET status='pending',attempts=0,next_attempt_at=now(),last_error=NULL,sent_at=NULL,updated_at=now() WHERE id=$1 AND organization_id=$2 AND status='failed' RETURNING id",[alertId,request.principal!.organizationId]);if(!result.rowCount)return reply.code(409).send({error:"alert_not_retryable"});await audit(request.principal!.organizationId,request.principal!.id,"alert.retry","alert_delivery",alertId);return reply.code(202).send({ok:true});
+});
+
 app.get("/api/v1/settings", { preHandler: requireAuth }, async (request: AuthedRequest) => {
   const result = await pool.query(`SELECT o.name,o.timezone,o.retention_days,s.smtp_host,s.smtp_port,s.smtp_secure,s.smtp_username,s.smtp_from,s.alert_recipients,s.alert_min_severity,s.alert_cooldown_minutes,(s.smtp_password_encrypted IS NOT NULL) smtp_password_set FROM organizations o JOIN system_settings s ON s.organization_id=o.id WHERE o.id=$1`, [request.principal!.organizationId]);
   return { settings: result.rows[0] };
 });
-app.patch("/api/v1/settings", { preHandler: [requireAuth, requireAdmin] }, async (request: AuthedRequest) => {
+app.patch("/api/v1/settings", { preHandler: [requireAuth, requireAdmin] }, async (request: AuthedRequest, reply) => {
   const body = request.body as Record<string, unknown>;
   const orgId = request.principal!.organizationId;
+  const smtpHost=asText(body.smtpHost,250);const smtpPort=Number(body.smtpPort);const smtpUsername=asText(body.smtpUsername,250);const smtpFrom=asText(body.smtpFrom,254);
+  const recipients=Array.isArray(body.alertRecipients)?body.alertRecipients.filter(isEmail):[];const suppliedRecipients=Array.isArray(body.alertRecipients)?body.alertRecipients.length:0;
+  const cooldown=Number(body.alertCooldownMinutes)||15;const existing=await pool.query("SELECT smtp_password_encrypted FROM system_settings WHERE organization_id=$1",[orgId]);
+  if(suppliedRecipients!==recipients.length||cooldown<1||cooldown>1440||smtpHost&&(!Number.isInteger(smtpPort)||smtpPort<1||smtpPort>65535||!isEmail(smtpFrom)||!recipients.length)||smtpUsername&&!body.smtpPassword&&!existing.rows[0]?.smtp_password_encrypted)return reply.code(400).send({error:"invalid_smtp_settings"});
   await pool.query("UPDATE organizations SET name=coalesce($1,name),timezone=coalesce($2,timezone),retention_days=coalesce($3,retention_days) WHERE id=$4", [asText(body.name, 100) || null, asText(body.timezone, 80) || null, body.retentionDays ? Number(body.retentionDays) : null, orgId]);
   const encrypted = typeof body.smtpPassword === "string" && body.smtpPassword ? encryptSecret(body.smtpPassword) : null;
   await pool.query(`
     UPDATE system_settings SET smtp_host=$1,smtp_port=$2,smtp_secure=$3,smtp_username=$4,
       smtp_password_encrypted=coalesce($5,smtp_password_encrypted),smtp_from=$6,alert_recipients=$7,
       alert_min_severity=$8,alert_cooldown_minutes=$9 WHERE organization_id=$10
-  `, [asText(body.smtpHost, 250) || null, Number(body.smtpPort) || null, body.smtpSecure !== false, asText(body.smtpUsername, 250) || null, encrypted, asText(body.smtpFrom, 254) || null, Array.isArray(body.alertRecipients) ? body.alertRecipients.filter(isEmail) : [], ["Medium", "High", "Critical"].includes(String(body.alertMinSeverity)) ? body.alertMinSeverity : "High", Math.max(1, Number(body.alertCooldownMinutes) || 15), orgId]);
+  `, [smtpHost || null, smtpPort || null, body.smtpSecure !== false, smtpUsername || null, encrypted, smtpFrom || null, recipients, ["Medium", "High", "Critical"].includes(String(body.alertMinSeverity)) ? body.alertMinSeverity : "High", cooldown, orgId]);
   await audit(orgId, request.principal!.id, "settings.update", "organization", orgId);
   return { ok: true };
 });
 app.post("/api/v1/settings/test-email", { preHandler: [requireAuth, requireAdmin] }, async (request: AuthedRequest, reply) => {
   const result = await pool.query("SELECT * FROM system_settings WHERE organization_id=$1", [request.principal!.organizationId]);
   const settings = result.rows[0];
-  if (!settings.smtp_host || !settings.smtp_password_encrypted || !settings.smtp_from || !settings.alert_recipients.length) return reply.code(400).send({ error: "smtp_not_configured" });
-  const transporter = nodemailer.createTransport({ host: settings.smtp_host, port: settings.smtp_port, secure: settings.smtp_secure, auth: settings.smtp_username ? { user: settings.smtp_username, pass: decryptSecret(settings.smtp_password_encrypted) } : undefined });
-  await transporter.sendMail({ from: settings.smtp_from, to: settings.alert_recipients, subject: "[Summary Log AI] ทดสอบการแจ้งเตือน", text: "การตั้งค่า SMTP ใช้งานได้สำเร็จ" });
-  return { ok: true };
+  if (!settings.smtp_host || !settings.smtp_from || !settings.alert_recipients.length || settings.smtp_username&&!settings.smtp_password_encrypted) return reply.code(400).send({ error: "smtp_not_configured" });
+  const deliveries=[] as string[];for(const recipient of settings.alert_recipients){const deliveryId=id();await pool.query(`INSERT INTO alert_deliveries(id,organization_id,recipient,channel,delivery_type,window_start,window_end,highest_severity,subject,item_count,next_attempt_at)
+    VALUES($1,$2,$3,'email','test',now(),now(),NULL,'[Summary Log AI] SMTP test',0,now())`,[deliveryId,request.principal!.organizationId,recipient]);deliveries.push(deliveryId);}
+  await audit(request.principal!.organizationId,request.principal!.id,"alert.test.queued","alert_delivery",deliveries[0]||null);
+  return reply.code(202).send({ ok: true, deliveryIds: deliveries });
 });
 
 app.get("/api/v1/stream", { preHandler: requireAuth }, async (request: AuthedRequest, reply) => {
