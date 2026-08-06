@@ -1,0 +1,7 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { effectiveThreshold, mergeRuleConfigs, robustSuggestedThreshold, validateRuleUpdate } from "../src/rule-config.js";
+
+test("source config overrides organization defaults",()=>{const configs=mergeRuleConfigs([{rule_code:"HIGH_CONNECTION_RATE",source_id:null,enabled:true,points:20,cooldown_minutes:12,threshold:{minimum:120}}],[{rule_code:"HIGH_CONNECTION_RATE",source_id:"source",enabled:true,points:30,cooldown_minutes:5,threshold:{minimum:200}}]);assert.equal(configs.HIGH_CONNECTION_RATE.threshold.minimum,200);assert.equal(configs.HIGH_CONNECTION_RATE.scope,"source");});
+test("rule validation rejects unsafe values",()=>{assert.equal(validateRuleUpdate("HIGH_CONNECTION_RATE",{enabled:true,points:101,cooldownMinutes:10,threshold:{minimum:100}}),null);assert.equal(validateRuleUpdate("HIGH_FAILURE_RATIO",{enabled:true,points:30,cooldownMinutes:10,threshold:{count:10,ratio:1.1}}),null);assert.deepEqual(validateRuleUpdate("UNCOMMON_PORT",{enabled:true,points:10,cooldownMinutes:10,threshold:{ports:[443,80,443]}})?.threshold.ports,[80,443]);});
+test("baseline only raises configured threshold and is capped at four times",()=>{assert.equal(robustSuggestedThreshold(120,10),150);assert.equal(effectiveThreshold(100,80,"ready"),100);assert.equal(effectiveThreshold(100,900,"ready"),400);assert.equal(effectiveThreshold(100,250,"learning"),100);});

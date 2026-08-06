@@ -48,6 +48,8 @@ export default function ProductConsole(){
   useEffect(()=>{boot();},[boot]);useEffect(()=>{refresh();},[refresh]);
   useEffect(()=>{const value=new URLSearchParams(window.location.search).get("tab") as Tab|null;if(value&&["overview","incidents","sources","allowlist","rules","users","settings"].includes(value))setTab(value);},[]);
   useEffect(()=>{if(tab==="incidents")window.location.assign("/app/incidents");},[tab]);
+  useEffect(()=>{if(tab==="rules")window.location.assign("/app/rules");},[tab]);
+  useEffect(()=>{if(tab==="allowlist")window.location.assign("/app/allowlist");},[tab]);
   useEffect(()=>{if(phase!=="ready")return;const stream=new EventSource(`/api/v1/stream?cursor=${snapshot.cursor}`);stream.onopen=()=>setConnection("live");stream.onerror=()=>setConnection("reconnecting");stream.addEventListener("update",()=>refresh());const timer=setInterval(refresh,15000);return()=>{stream.close();clearInterval(timer);};},[phase,refresh,snapshot.cursor]);
   const isAdmin=user?.role==="admin",canWrite=user?.role!=="viewer";
   const timeZone=safeTimeZone(settings.timezone);

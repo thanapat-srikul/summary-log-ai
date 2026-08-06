@@ -93,6 +93,8 @@ ALTER TABLE incidents ADD COLUMN IF NOT EXISTS assignee_user_id uuid REFERENCES 
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS first_seen_at timestamptz;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_seen_at timestamptz;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS occurrence_count integer NOT NULL DEFAULT 1;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS suppressed_count integer NOT NULL DEFAULT 0;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_suppressed_at timestamptz;
 UPDATE incidents SET first_seen_at=coalesce(first_seen_at,detected_at),last_seen_at=coalesce(last_seen_at,detected_at);
 ALTER TABLE incidents ALTER COLUMN first_seen_at SET NOT NULL;
 ALTER TABLE incidents ALTER COLUMN last_seen_at SET NOT NULL;
@@ -143,6 +145,53 @@ CREATE TABLE IF NOT EXISTS allowlist_entries (
   expires_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   CHECK (cidr IS NOT NULL OR port IS NOT NULL OR protocol IS NOT NULL)
+);
+CREATE TABLE IF NOT EXISTS rule_configs (
+  id uuid PRIMARY KEY,
+  organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+  source_id uuid REFERENCES sources(id) ON DELETE CASCADE,
+  rule_code text NOT NULL,
+  enabled boolean NOT NULL,
+  points integer NOT NULL CHECK (points BETWEEN 0 AND 100),
+  threshold jsonb NOT NULL,
+  cooldown_minutes integer NOT NULL CHECK (cooldown_minutes BETWEEN 1 AND 1440),
+  updated_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS rule_configs_default_idx ON rule_configs(organization_id,rule_code) WHERE source_id IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS rule_configs_source_idx ON rule_configs(source_id,rule_code) WHERE source_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS baseline_profiles (
+  source_id uuid NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  hour_of_day integer NOT NULL CHECK (hour_of_day BETWEEN 0 AND 23),
+  rule_code text NOT NULL,
+  sample_count integer NOT NULL,
+  day_count integer NOT NULL,
+  median double precision NOT NULL,
+  p95 double precision NOT NULL,
+  mad double precision NOT NULL,
+  suggested_threshold double precision NOT NULL,
+  status text NOT NULL CHECK (status IN ('learning','ready','insufficient_data')),
+  computed_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY(source_id,hour_of_day,rule_code)
+);
+CREATE TABLE IF NOT EXISTS baseline_rebuild_requests (
+  source_id uuid PRIMARY KEY REFERENCES sources(id) ON DELETE CASCADE,
+  requested_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  requested_at timestamptz NOT NULL DEFAULT now(),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','running','complete','failed')),
+  completed_at timestamptz,
+  last_error text
+);
+CREATE TABLE IF NOT EXISTS rule_suppressions (
+  source_id uuid NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  src_ip inet NOT NULL,
+  rule_code text NOT NULL,
+  incident_id uuid REFERENCES incidents(id) ON DELETE SET NULL,
+  last_triggered_at timestamptz NOT NULL,
+  cooldown_until timestamptz NOT NULL,
+  suppressed_count integer NOT NULL DEFAULT 0,
+  max_actual double precision NOT NULL DEFAULT 0,
+  PRIMARY KEY(source_id,src_ip,rule_code)
 );
 CREATE TABLE IF NOT EXISTS ingest_batches (
   id bigserial PRIMARY KEY,
@@ -195,6 +244,8 @@ CREATE INDEX IF NOT EXISTS incidents_merge_idx ON incidents(source_id,src_ip,las
 CREATE INDEX IF NOT EXISTS incidents_assignee_idx ON incidents(assignee_user_id,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS incidents_filter_idx ON incidents(status,severity,last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS incident_occurrences_incident_idx ON incident_occurrences(incident_id,observed_at DESC);
+CREATE INDEX IF NOT EXISTS baseline_profiles_status_idx ON baseline_profiles(source_id,status,computed_at DESC);
+CREATE INDEX IF NOT EXISTS rule_suppressions_cooldown_idx ON rule_suppressions(cooldown_until);
 CREATE INDEX IF NOT EXISTS event_dedup_created_idx ON event_dedup(created_at);
 CREATE INDEX IF NOT EXISTS sessions_expires_idx ON sessions(expires_at);
 

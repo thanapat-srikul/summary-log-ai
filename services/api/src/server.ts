@@ -6,8 +6,9 @@ import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import nodemailer from "nodemailer";
 import pg from "pg";
-import { evaluateRules, validateEvent } from "./rules.js";
+import { evaluateRules, incidentThreshold, RULE_DEFINITIONS, validateEvent, type BaselineThreshold, type RuleConfig } from "./rules.js";
 import { canTransition, type IncidentStatus } from "./incident-policy.js";
+import { mergeRuleConfigs, validateRuleUpdate, type StoredRuleConfig } from "./rule-config.js";
 
 const { Pool } = pg;
 const app = Fastify({ logger: { redact: ["req.headers.authorization", "req.headers.cookie", "body", "password", "apiKey"] }, bodyLimit: 1024 * 1024 });
@@ -30,6 +31,20 @@ function isEmail(value: unknown): value is string { return typeof value === "str
 function asText(value: unknown, max = 200) { return typeof value === "string" ? value.trim().slice(0, max) : ""; }
 function audit(orgId: string, actor: string | null, action: string, targetType: string, targetId: string | null) {
   return pool.query("INSERT INTO audit_log(organization_id, actor_user_id, action, target_type, target_id) VALUES($1,$2,$3,$4,$5)", [orgId, actor, action, targetType, targetId]);
+}
+type Queryable={query:(text:string,values?:unknown[])=>Promise<{rows:Record<string,unknown>[];rowCount:number|null}>};
+async function loadRuleContext(db:Queryable,organizationId:string,sourceId:string,observedAt:Date):Promise<{configs:Record<string,RuleConfig>;baselines:Record<string,BaselineThreshold>}>{
+  const [stored,baseline]=await Promise.all([
+    db.query("SELECT rule_code,source_id,enabled,points,cooldown_minutes,threshold FROM rule_configs WHERE organization_id=$1 AND (source_id IS NULL OR source_id=$2) ORDER BY source_id NULLS FIRST",[organizationId,sourceId]),
+    db.query(`SELECT b.* FROM baseline_profiles b JOIN sources s ON s.id=b.source_id JOIN organizations o ON o.id=s.organization_id
+      WHERE b.source_id=$1 AND b.hour_of_day=extract(hour FROM $2::timestamptz AT TIME ZONE o.timezone)::int`,[sourceId,observedAt]),
+  ]);
+  const defaults=stored.rows.filter(row=>!row.source_id) as StoredRuleConfig[];const overrides=stored.rows.filter(row=>row.source_id) as StoredRuleConfig[];
+  const baselines:Record<string,BaselineThreshold>={};for(const row of baseline.rows){
+    const code=String(row.rule_code);const storedStatus=String(row.status) as BaselineThreshold["status"];
+    baselines[code]={value:Number(row.suggested_threshold),sampleCount:Number(row.sample_count),status:new Date(String(row.computed_at)).getTime()<Date.now()-2*60*60_000?"stale":storedStatus};
+  }
+  return{configs:mergeRuleConfigs(defaults,overrides),baselines};
 }
 function encryptSecret(value: string) {
   if (!appSecret || appSecret.length < 32) throw new Error("APP_SECRET must be at least 32 characters");
@@ -98,7 +113,7 @@ await app.register(rateLimit, { global: false });
 app.get("/api/v1/health", async () => {
   const db = await pool.query("SELECT now() AS now");
   const sources = await pool.query("SELECT max(last_seen_at) AS latest FROM sources");
-  return { status: "ok", version: "0.3.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
+  return { status: "ok", version: "0.4.0", databaseTime: db.rows[0].now, lastBatchAt: sources.rows[0].latest };
 });
 
 app.get("/api/v1/setup/status", async () => {
@@ -212,15 +227,18 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const ruleContexts=new Map<string,Awaited<ReturnType<typeof loadRuleContext>>>();
     for (const event of timely) {
       const dedup = await client.query("INSERT INTO event_dedup(source_id,uid,event_ts) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING uid", [source.id, event.uid, new Date(event.ts * 1000)]);
       if (!dedup.rowCount) { duplicates += 1; continue; }
       accepted += 1;
       const bucket = bucketDate(event.ts);
+      const contextKey=bucket.toISOString().slice(0,13);let ruleContext=ruleContexts.get(contextKey);if(!ruleContext){ruleContext=await loadRuleContext(client,source.organization_id,source.id,bucket);ruleContexts.set(contextKey,ruleContext);}
       const bytes = event.orig_bytes + event.resp_bytes;
       const packets = event.orig_pkts + event.resp_pkts;
       const failed = failedStates.has(event.conn_state) ? 1 : 0;
-      const uncommon = standardPorts.has(event.resp_p) ? 0 : 1;
+      const configuredPorts=ruleContext.configs.UNCOMMON_PORT.threshold.ports||[...standardPorts];
+      const uncommon = configuredPorts.includes(event.resp_p) ? 0 : 1;
       await client.query(`
         INSERT INTO flow_buckets(source_id,bucket_ts,protocol,flow_count,byte_count,packet_count,failed_count)
         VALUES($1,$2,$3,1,$4,$5,$6)
@@ -244,9 +262,9 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
       const rule = evaluateRules({
         connectionCount: Number(h.connection_count), uniqueDestinations: h.destinations.length, failedCount: Number(h.failed_count),
         byteCount: Number(h.byte_count), uncommonPortCount: Number(h.uncommon_port_count), maxDurationMs: Number(h.max_duration_ms), maxFlowBytes: Number(h.max_flow_bytes),
-      }, event);
+      }, event,ruleContext.configs,ruleContext.baselines);
       await client.query("UPDATE host_buckets SET max_score=greatest(max_score,$1) WHERE source_id=$2 AND bucket_ts=$3 AND src_ip=$4", [rule.score, source.id, bucket, event.orig_h]);
-      if (rule.score >= 45) {
+      if (rule.score >= incidentThreshold(ruleContext.configs)) {
         const allowlisted = await client.query(`
           SELECT EXISTS(SELECT 1 FROM allowlist_entries WHERE organization_id=$1
             AND (source_id IS NULL OR source_id=$2) AND (expires_at IS NULL OR expires_at>now())
@@ -255,6 +273,19 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
         `, [source.organization_id, source.id, event.orig_h, event.resp_p, event.proto]);
         if (!allowlisted.rows[0].allowed) {
           const observedAt = new Date(event.ts * 1000);
+          const activeMatches:typeof rule.matches=[];const suppressedMatches:typeof rule.matches=[];const suppressedIncidentIds:string[]=[];
+          for(const match of rule.matches){
+            const suppression=await client.query("SELECT incident_id,cooldown_until FROM rule_suppressions WHERE source_id=$1 AND src_ip=$2::inet AND rule_code=$3 FOR UPDATE",[source.id,event.orig_h,match.code]);
+            if(suppression.rowCount&&observedAt<new Date(suppression.rows[0].cooldown_until)){
+              match.suppressed=true;suppressedMatches.push(match);if(suppression.rows[0].incident_id)suppressedIncidentIds.push(suppression.rows[0].incident_id);
+              await client.query("UPDATE rule_suppressions SET last_triggered_at=$4,suppressed_count=suppressed_count+1,max_actual=greatest(max_actual,$5) WHERE source_id=$1 AND src_ip=$2::inet AND rule_code=$3",[source.id,event.orig_h,match.code,observedAt,match.actual]);
+            }else activeMatches.push(match);
+          }
+          if(!activeMatches.length){
+            const suppressedIncidentId=suppressedIncidentIds[0];
+            if(suppressedIncidentId)await client.query("UPDATE incidents SET last_seen_at=greatest(last_seen_at,$2),suppressed_count=suppressed_count+1,last_suppressed_at=$2,updated_at=now() WHERE id=$1",[suppressedIncidentId,observedAt]);
+          }else{
+          const activeCodes=activeMatches.map(match=>match.code);
           const latest = await client.query(`
             SELECT id,status FROM incidents
             WHERE source_id=$1 AND src_ip=$2::inet AND last_seen_at<=$3
@@ -270,19 +301,24 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
               rule_codes=ARRAY(SELECT DISTINCT unnest(rule_codes || $8::text[])),
               reason=$9,suggested_action=$10,byte_count=$11,packet_count=$12,
               occurrence_count=occurrence_count+1,
+              suppressed_count=suppressed_count+$13,
+              last_suppressed_at=CASE WHEN $13>0 THEN $2 ELSE last_suppressed_at END,
               status=CASE WHEN status='resolved' THEN 'investigating' ELSE status END,
               resolution=CASE WHEN status='resolved' THEN NULL ELSE resolution END,updated_at=now()
             WHERE id=$1 RETURNING id,severity,status
-          `, [incidentId, observedAt, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count)]) : await client.query(`
-            INSERT INTO incidents(id,source_id,bucket_ts,detected_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,reason,suggested_action,byte_count,packet_count,first_seen_at,last_seen_at,occurrence_count)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$4,$4,1)
+          `, [incidentId, observedAt, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, activeCodes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count), suppressedMatches.length ? 1 : 0]) : await client.query(`
+            INSERT INTO incidents(id,source_id,bucket_ts,detected_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,reason,suggested_action,byte_count,packet_count,first_seen_at,last_seen_at,occurrence_count,suppressed_count,last_suppressed_at)
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$4,$4,1,$16,CASE WHEN $16>0 THEN $4 ELSE NULL END)
             RETURNING id,severity,status
-          `, [incidentId, source.id, bucket, observedAt, event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count)]);
+          `, [incidentId, source.id, bucket, observedAt, event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, activeCodes, rule.reason, rule.action, Number(h.byte_count), Number(h.packet_count), suppressedMatches.length ? 1 : 0]);
           const occurrenceId = id();
           await client.query(`
             INSERT INTO incident_occurrences(id,incident_id,observed_at,src_ip,dst_ip,dst_port,protocol,score,severity,rule_codes,score_breakdown,connection_count,destination_count,failed_count,failed_ratio,byte_count,packet_count,max_duration_ms)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14,$15,$16,$17,$18)
-          `, [occurrenceId, incidentId, observedAt, event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, rule.codes, JSON.stringify(rule.matches), Number(h.connection_count), h.destinations.length, Number(h.failed_count), Number(h.failed_count) / Math.max(1, Number(h.connection_count)), Number(h.byte_count), Number(h.packet_count), Number(h.max_duration_ms)]);
+          `, [occurrenceId, incidentId, observedAt, event.orig_h, event.resp_h, event.resp_p, event.proto, rule.score, rule.severity, activeCodes, JSON.stringify(rule.matches), Number(h.connection_count), h.destinations.length, Number(h.failed_count), Number(h.failed_count) / Math.max(1, Number(h.connection_count)), Number(h.byte_count), Number(h.packet_count), Number(h.max_duration_ms)]);
+          for(const match of activeMatches)await client.query(`INSERT INTO rule_suppressions(source_id,src_ip,rule_code,incident_id,last_triggered_at,cooldown_until,suppressed_count,max_actual)
+            VALUES($1,$2,$3,$4,$5,$5::timestamptz+($6||' minutes')::interval,0,$7)
+            ON CONFLICT(source_id,src_ip,rule_code) DO UPDATE SET incident_id=excluded.incident_id,last_triggered_at=excluded.last_triggered_at,cooldown_until=excluded.cooldown_until,max_actual=greatest(rule_suppressions.max_actual,excluded.max_actual)`,[source.id,event.orig_h,match.code,incidentId,observedAt,match.cooldownMinutes,match.actual]);
           await client.query(`INSERT INTO incident_history(incident_id,from_status,to_status,action,note,metadata)
             VALUES($1,$2,$3,$4,$5,$6::jsonb)`, [incidentId, latest.rows[0]?.status ?? null, incident.rows[0].status, latest.rowCount ? (wasResolved ? "reopened" : "merged") : "created", wasResolved ? "Incident reopened after a matching occurrence" : null, JSON.stringify({ occurrenceId, observedAt })]);
           await client.query("UPDATE flow_buckets SET anomaly_count=anomaly_count+1 WHERE source_id=$1 AND bucket_ts=$2 AND protocol=$3", [source.id, bucket, event.proto]);
@@ -307,6 +343,7 @@ app.post("/api/v1/ingest/zeek", async (request, reply) => {
                 )
               ON CONFLICT DO NOTHING
             `, [incident.rows[0].id, source.organization_id, incident.rows[0].severity, event.orig_h, occurrenceId]);
+          }
           }
         }
       }
@@ -427,8 +464,47 @@ app.post("/api/v1/incidents/:id/notes", { preHandler: [requireAuth, requireWrite
   return reply.code(201).send({ ok: true });
 });
 
+app.get("/api/v1/rules",{preHandler:requireAuth},async(request:AuthedRequest)=>{
+  const orgId=request.principal!.organizationId;
+  const [configs,sources,baselines,rebuilds]=await Promise.all([
+    pool.query("SELECT id,source_id,rule_code,enabled,points,threshold,cooldown_minutes,updated_at FROM rule_configs WHERE organization_id=$1 ORDER BY source_id NULLS FIRST,rule_code",[orgId]),
+    pool.query("SELECT id,name FROM sources WHERE organization_id=$1 ORDER BY name",[orgId]),
+    pool.query(`SELECT b.*,CASE WHEN b.computed_at<now()-interval '2 hours' THEN 'stale' ELSE b.status END AS status
+      FROM baseline_profiles b JOIN sources s ON s.id=b.source_id WHERE s.organization_id=$1 ORDER BY b.source_id,b.hour_of_day,b.rule_code`,[orgId]),
+    pool.query("SELECT r.* FROM baseline_rebuild_requests r JOIN sources s ON s.id=r.source_id WHERE s.organization_id=$1",[orgId]),
+  ]);
+  return{definitions:Object.values(RULE_DEFINITIONS),configs:configs.rows,sources:sources.rows,baselines:baselines.rows,rebuilds:rebuilds.rows};
+});
+
+app.patch("/api/v1/rules/defaults/:code",{preHandler:[requireAuth,requireAdmin]},async(request:AuthedRequest,reply)=>{
+  const code=(request.params as{code:string}).code;const parsed=validateRuleUpdate(code,request.body);if(!parsed)return reply.code(400).send({error:"invalid_rule_config"});const orgId=request.principal!.organizationId;
+  const updated=await pool.query("UPDATE rule_configs SET enabled=$1,points=$2,threshold=$3::jsonb,cooldown_minutes=$4,updated_by=$5,updated_at=now() WHERE organization_id=$6 AND source_id IS NULL AND rule_code=$7 RETURNING id",[parsed.enabled,parsed.points,JSON.stringify(parsed.threshold),parsed.cooldownMinutes,request.principal!.id,orgId,code]);
+  if(!updated.rowCount)await pool.query("INSERT INTO rule_configs(id,organization_id,source_id,rule_code,enabled,points,threshold,cooldown_minutes,updated_by) VALUES($1,$2,NULL,$3,$4,$5,$6::jsonb,$7,$8)",[id(),orgId,code,parsed.enabled,parsed.points,JSON.stringify(parsed.threshold),parsed.cooldownMinutes,request.principal!.id]);
+  await audit(orgId,request.principal!.id,"rule.default.update","rule",code);return{ok:true};
+});
+
+app.patch("/api/v1/sources/:sourceId/rules/:code",{preHandler:[requireAuth,requireAdmin]},async(request:AuthedRequest,reply)=>{
+  const {sourceId,code}=request.params as{sourceId:string;code:string};const parsed=validateRuleUpdate(code,request.body);if(!parsed)return reply.code(400).send({error:"invalid_rule_config"});const orgId=request.principal!.organizationId;
+  const source=await pool.query("SELECT id FROM sources WHERE id=$1 AND organization_id=$2",[sourceId,orgId]);if(!source.rowCount)return reply.code(404).send({error:"source_not_found"});
+  const updated=await pool.query("UPDATE rule_configs SET enabled=$1,points=$2,threshold=$3::jsonb,cooldown_minutes=$4,updated_by=$5,updated_at=now() WHERE source_id=$6 AND rule_code=$7 RETURNING id",[parsed.enabled,parsed.points,JSON.stringify(parsed.threshold),parsed.cooldownMinutes,request.principal!.id,sourceId,code]);
+  if(!updated.rowCount)await pool.query("INSERT INTO rule_configs(id,organization_id,source_id,rule_code,enabled,points,threshold,cooldown_minutes,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)",[id(),orgId,sourceId,code,parsed.enabled,parsed.points,JSON.stringify(parsed.threshold),parsed.cooldownMinutes,request.principal!.id]);
+  await audit(orgId,request.principal!.id,"rule.source.update","rule",`${sourceId}:${code}`);return{ok:true};
+});
+
+app.delete("/api/v1/sources/:sourceId/rules/:code",{preHandler:[requireAuth,requireAdmin]},async(request:AuthedRequest,reply)=>{
+  const {sourceId,code}=request.params as{sourceId:string;code:string};const result=await pool.query("DELETE FROM rule_configs c USING sources s WHERE c.source_id=s.id AND c.source_id=$1 AND c.rule_code=$2 AND s.organization_id=$3 RETURNING c.id",[sourceId,code,request.principal!.organizationId]);if(!result.rowCount)return reply.code(404).send({error:"rule_override_not_found"});await audit(request.principal!.organizationId,request.principal!.id,"rule.source.reset","rule",`${sourceId}:${code}`);return{ok:true};
+});
+
+app.post("/api/v1/sources/:sourceId/baseline/rebuild",{preHandler:[requireAuth,requireAdmin]},async(request:AuthedRequest,reply)=>{
+  const sourceId=(request.params as{sourceId:string}).sourceId;const source=await pool.query("SELECT id FROM sources WHERE id=$1 AND organization_id=$2",[sourceId,request.principal!.organizationId]);if(!source.rowCount)return reply.code(404).send({error:"source_not_found"});await pool.query(`INSERT INTO baseline_rebuild_requests(source_id,requested_by,status,requested_at,completed_at,last_error) VALUES($1,$2,'pending',now(),NULL,NULL)
+    ON CONFLICT(source_id) DO UPDATE SET requested_by=excluded.requested_by,status='pending',requested_at=now(),completed_at=NULL,last_error=NULL`,[sourceId,request.principal!.id]);await audit(request.principal!.organizationId,request.principal!.id,"baseline.rebuild","source",sourceId);return reply.code(202).send({ok:true});
+});
+
 app.get("/api/v1/allowlist", { preHandler: requireAuth }, async (request: AuthedRequest) => {
-  const result = await pool.query("SELECT a.*,s.name source_name FROM allowlist_entries a LEFT JOIN sources s ON s.id=a.source_id WHERE a.organization_id=$1 ORDER BY a.created_at DESC", [request.principal!.organizationId]);
+  const query=request.query as{q?:string;status?:string};const values:unknown[]=[request.principal!.organizationId];const where=["a.organization_id=$1"];
+  if(query.status==="active")where.push("(a.expires_at IS NULL OR a.expires_at>now())");if(query.status==="expired")where.push("a.expires_at<=now()");
+  if(query.q){values.push(`%${asText(query.q,100)}%`);where.push(`(a.cidr::text ILIKE $${values.length} OR a.description ILIKE $${values.length} OR s.name ILIKE $${values.length})`);}
+  const result = await pool.query(`SELECT a.*,s.name source_name,CASE WHEN a.expires_at IS NOT NULL AND a.expires_at<=now() THEN 'expired' ELSE 'active' END state FROM allowlist_entries a LEFT JOIN sources s ON s.id=a.source_id WHERE ${where.join(" AND ")} ORDER BY a.created_at DESC`, values);
   return { entries: result.rows };
 });
 app.post("/api/v1/allowlist", { preHandler: [requireAuth, requireWrite] }, async (request: AuthedRequest, reply) => {

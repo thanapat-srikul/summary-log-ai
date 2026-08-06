@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+- Add Admin-managed organization rule defaults and per-Source overrides for thresholds, scores, enabled state, and cooldown.
+- Build automatic seven-day hourly baselines from summary buckets using median, P95, and MAD without storing Raw Logs.
+- Add rule-level suppression and cooldown so repeated matches update evidence and counters without duplicate occurrences or email.
+- Add a Rule Management page showing Admin, Baseline, and effective thresholds with reset and rebuild controls.
+- Expand Allowlist management with search, expiry state, Source scope, CIDR, port, and protocol filters.
+- Show threshold origin and suppressed matches in Incident score breakdowns.
+
 ## 0.3.0
 
 - Merge matching incidents from the same Source and Source IP within a ten-minute window, including resolved-incident reopening.
